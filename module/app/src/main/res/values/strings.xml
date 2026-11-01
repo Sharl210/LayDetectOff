@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">平放检测关闭</string>
+    <string name="app_desc">关闭 realme/OPPO/一加 系统里无 UI 开关的平放检测（TP 节点 171）</string>
+</resources>

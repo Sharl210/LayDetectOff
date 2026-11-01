@@ -1,0 +1,23 @@
+pluginManagement {
+    repositories {
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        google()
+        mavenCentral()
+        // 官方 Xposed API 源 api.xposed.info 已下线，
+        // 阿里云镜像仍保有 de.robv.android.xposed:api:82。
+        maven {
+            url 'https://maven.aliyun.com/repository/public'
+        }
+    }
+}
+
+rootProject.name = "LayDetectOff"
+include(":app")

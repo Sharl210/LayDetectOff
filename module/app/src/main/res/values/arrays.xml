@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+        推荐作用域。
+        LSPosed 读取 AndroidManifest 里的 xposedscope 元数据后，
+        会把这些包名自动勾选为模块作用域。
+
+        com.oplus.gesture 是 realme / OPPO / 一加系统里的手势引擎服务，
+        本机实测它是 lay_detect（平放检测）传感器的唯一持有者。
+        如果你在别的机型上发现目标进程不同，改这里即可。
+    -->
+    <string-array name="scope">
+        <item>com.oplus.gesture</item>
+    </string-array>
+</resources>

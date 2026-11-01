@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <application
+        android:allowBackup="false"
+        android:extractNativeLibs="true"
+        android:label="@string/app_name"
+        android:supportsRtl="true">
+
+        <!-- Xposed / LSPosed 模块识别所必需 -->
+        <meta-data
+            android:name="xposedmodule"
+            android:value="true" />
+        <meta-data
+            android:name="xposeddescription"
+            android:value="@string/app_desc" />
+        <meta-data
+            android:name="xposedminversion"
+            android:value="82" />
+
+        <!--
+            推荐作用域：LSPosed 安装后会据此自动勾选下列包，无需手动翻找。
+            数据定义在 res/values/arrays.xml 的 scope 数组里。
+        -->
+        <meta-data
+            android:name="xposedscope"
+            android:resource="@array/scope" />
+
+    </application>
+
+</manifest>

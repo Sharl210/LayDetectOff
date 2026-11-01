@@ -1,0 +1,37 @@
+# 构建产物
+*.apk
+*.aab
+*.ap_
+*.dex
+build/
+.gradle/
+
+# 签名与密钥（绝不入库）
+*.keystore
+*.jks
+*.p12
+*.pfx
+
+# 本地依赖与工具二进制（按需自行下载，见 README）
+*.jar
+*.aar
+*.class
+tools/work/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# 系统
+.DS_Store
+Thumbs.db
+
+# 本地分析产物
+apk/
+dex/
+gsrc/
+fsrc/
+sysui_src/
+verify*/
+*.log
