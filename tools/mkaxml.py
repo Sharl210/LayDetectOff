@@ -12,6 +12,8 @@ ATTR_EXTRACT_NATIVE_LIBS = 0x010104ea
 ATTR_NAME = 0x01010003
 ATTR_VALUE = 0x01010024
 ATTR_RESOURCE = 0x01010025
+ATTR_MIN_SDK_VERSION = 0x0101020c
+ATTR_TARGET_SDK_VERSION = 0x01010270
 
 TYPE_REFERENCE = 0x01
 SCOPE_ARRAY_RES_ID = 0x7f010000
@@ -87,12 +89,14 @@ def make_end_element(name_idx, ns_idx=NO_INDEX, line=1):
     return struct.pack("<HHIII", 0x0103, 16, 16 + len(body), line, NO_INDEX) + body
 
 
-def build_manifest(package, version_code, version_name, label, module_desc, min_version=82):
+def build_manifest(package, version_code, version_name, label, module_desc, min_version=82, min_sdk=29, target_sdk=35):
     attr_names = ["versionCode", "versionName", "label", "hasCode",
-                  "extractNativeLibs", "name", "value", "resource"]
+                  "extractNativeLibs", "name", "value", "resource",
+                  "minSdkVersion", "targetSdkVersion"]
     res_ids = [ATTR_VERSION_CODE, ATTR_VERSION_NAME, ATTR_LABEL, ATTR_HAS_CODE,
-               ATTR_EXTRACT_NATIVE_LIBS, ATTR_NAME, ATTR_VALUE, ATTR_RESOURCE]
-    body_strings = ["package", "manifest", "application", "meta-data",
+               ATTR_EXTRACT_NATIVE_LIBS, ATTR_NAME, ATTR_VALUE, ATTR_RESOURCE,
+               ATTR_MIN_SDK_VERSION, ATTR_TARGET_SDK_VERSION]
+    body_strings = ["package", "manifest", "uses-sdk", "application", "meta-data",
                     "android", ANDROID_NS,
                     package, version_name, label,
                     "xposedmodule", "xposeddescription", "xposedminversion", "xposedscope",
@@ -117,6 +121,14 @@ def build_manifest(package, version_code, version_name, label, module_desc, min_
          "type": TYPE_STRING, "data": i[version_name]},
     ])
 
+    c += make_start_element(i["uses-sdk"], [
+        {"ns": ns, "name": i["minSdkVersion"], "raw": NO_INDEX,
+         "type": TYPE_INT_DEC, "data": min_sdk},
+        {"ns": ns, "name": i["targetSdkVersion"], "raw": NO_INDEX,
+         "type": TYPE_INT_DEC, "data": target_sdk},
+    ])
+    c += make_end_element(i["uses-sdk"])
+
     c += make_start_element(i["application"], [
         {"ns": ns, "name": i["label"], "raw": i[label],
          "type": TYPE_STRING, "data": i[label]},
@@ -128,11 +140,14 @@ def build_manifest(package, version_code, version_name, label, module_desc, min_
 
     for k, v in [("xposedmodule", "true"),
                  ("xposeddescription", module_desc)]:
+        is_module_flag = k == "xposedmodule"
         c += make_start_element(i["meta-data"], [
             {"ns": ns, "name": i["name"], "raw": i[k],
              "type": TYPE_STRING, "data": i[k]},
-            {"ns": ns, "name": i["value"], "raw": i[v],
-             "type": TYPE_STRING, "data": i[v]},
+            {"ns": ns, "name": i["value"],
+             "raw": NO_INDEX if is_module_flag else i[v],
+             "type": TYPE_INT_BOOLEAN if is_module_flag else TYPE_STRING,
+             "data": 1 if is_module_flag else i[v]},
         ])
         c += make_end_element(i["meta-data"])
 
@@ -165,10 +180,10 @@ if __name__ == "__main__":
     out_path = sys.argv[1] if len(sys.argv) > 1 else "AndroidManifest.xml"
     data = build_manifest(
         package="com.dsh.laydetectoff",
-        version_code=1,
-        version_name="1.0.0",
+        version_code=2,
+        version_name="1.1.0",
         label="平放检测关闭",
-        module_desc="关闭 realme ColorOS 平放检测 TP 节点 171",
+        module_desc="移除面朝下状态对屏幕息屏超时的缩短",
     )
     with open(out_path, "wb") as f:
         f.write(data)

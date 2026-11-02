@@ -1,348 +1,453 @@
 package com.dsh.laydetectoff
 
-import android.app.Application
 import android.content.Context
+import android.os.Build
+import android.os.Process
 import de.robv.android.xposed.IXposedHookLoadPackage
+import de.robv.android.xposed.IXposedHookZygoteInit
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
 import org.luckypray.dexkit.DexKitBridge
 import org.luckypray.dexkit.query.FindMethod
-import org.luckypray.dexkit.result.MethodData
+import org.luckypray.dexkit.query.enums.UsingType
+import org.luckypray.dexkit.query.matchers.FieldMatcher
+import java.io.File
+import java.io.FileOutputStream
+import java.lang.reflect.Field
 import java.lang.reflect.Method
+import java.lang.reflect.Modifier
 import java.util.Collections
 import java.util.WeakHashMap
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.zip.ZipFile
 
 /**
- * 平放检测关闭模块（realme UI / ColorOS「倾斜·平放」TP 节点链路）。
+ * Disables only the face-down shortening of PowerManagerService's screen timeout.
  *
- * ============ 拦截策略（三层，由粗到细） ============
- *
- *  L1 断源：让 registerRecliningModeSensor() 直接 return，使 lay_detect 传感器根本不被注册。
- *           全机只有本进程持有该传感器，不注册 = 整条链路从源头死掉。
- *           这是首选，代价最小，且不影响同类里的陀螺仪校准。
- *
- *  L2 兜底：若传感器已被注册（例如模块在注册之后才加载），则拦 writeNodeFileByDevice，
- *           只吞 nodeFlag == 171 的写入，其余节点放行。
- *
- *  L3 语义：用 DexKit 在宿主 APK 里按结构找回 L1/L2 的目标，覆盖改名/重构的新版本。
- *
- * 三层都失败就不装任何 Hook —— 绝不退回「见方法就 hook」的兜底。
- *
- * ============ 为什么不拦 onSensorChanged ============
- * 同一个 onSensorChanged 里还有陀螺仪校准（type==4）与 AMD 传感器分支，
- * 整段吞掉会破坏校准状态机，症状是手势功能整体异常。必须拦在更窄的位置。
+ * DexKit selects the host method from its semantic/structural shape. The runtime
+ * callback then restores the same timeout-policy result that the method returns
+ * when the device is not face-down. Other timeout policy behavior is retained.
  */
-class HookEntry : IXposedHookLoadPackage {
+class HookEntry : IXposedHookLoadPackage, IXposedHookZygoteInit {
 
     companion object {
         private const val TAG = "LayDetectOff"
+        private const val MODULE_LIBRARY_DIR = "laydetectoff-native"
+        private const val NATIVE_LIBRARY_NAME = "libdexkit.so"
 
-        private val installed = Collections.synchronizedMap(
-            WeakHashMap<ClassLoader, Boolean>(),
-        )
+        private val stateLock = Any()
+        private val bootstrapped = Collections.synchronizedMap(WeakHashMap<ClassLoader, Boolean>())
+        private val installing = Collections.synchronizedMap(WeakHashMap<ClassLoader, Boolean>())
+        private val installed = Collections.synchronizedMap(WeakHashMap<ClassLoader, Boolean>())
+        private val adjustedLogOnce = AtomicBoolean(false)
+        private val policyFailureLogOnce = AtomicBoolean(false)
 
-        /** 累计拦截次数，供用户确认模块是否真的生效。 */
         @Volatile
-        var blockCount: Int = 0
-            private set
+        private var moduleApkPath: String? = null
 
-        /** 最近一次拦截的说明，便于对照日志。 */
         @Volatile
-        var lastEvent: String? = null
-            private set
+        private var dexKitLoaded = false
 
-        /** 探针结论：宿主固件是否支持 171 号节点。null = 尚未观测到。 */
-        @Volatile
-        var node171Supported: Boolean? = null
-            private set
-
-        fun log(msg: String) {
-            XposedBridge.log("$TAG: $msg")
+        fun log(message: String) {
+            XposedBridge.log("$TAG: $message")
         }
+    }
 
-        private fun record(what: String) {
-            blockCount++
-            lastEvent = what
-            log("[$what] 已拦截（累计 $blockCount 次）")
+    override fun initZygote(startupParam: IXposedHookZygoteInit.StartupParam) {
+        moduleApkPath = startupParam.modulePath.takeIf { File(it).isFile }
+        if (moduleApkPath == null) {
+            log("BLOCKED: initZygote 未提供可读的模块 APK 路径")
+        } else {
+            log("已从 Xposed StartupParam 取得模块 APK 路径")
         }
     }
 
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != Anchors.TARGET_PACKAGE) return
-        log("进入目标进程 ${lpparam.packageName}（pid=${android.os.Process.myPid()}）")
-
-        XposedHelpers.findAndHookMethod(
-            Application::class.java,
-            "attach",
-            Context::class.java,
-            object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    val app = param.thisObject as? Application ?: return
-                    val ctx = param.args.firstOrNull() as? Context ?: return
-                    install(app, ctx)
-                }
-            },
-        )
-    }
-
-    private fun install(app: Application, ctx: Context) {
-        val loader = ctx.classLoader ?: app.javaClass.classLoader ?: return
-        synchronized(installed) {
-            if (installed.containsKey(loader)) return
-            installed[loader] = true
+        val hostLoader = lpparam.classLoader ?: run {
+            log("BLOCKED: android 包未提供 ClassLoader")
+            return
         }
 
-        installProbe(loader)                    // 只读探针：报告 171 节点是否被固件支持
-
-        var n = 0
-        n += hookByName(loader)                 // L1 + L2 名字定位（快）
-        n += hookByDexKit(app.applicationInfo.sourceDir, loader)  // L3 语义定位（跨版本）
-
-        if (n == 0) {
-            log("所有定位路径均未命中，本轮不安装任何 Hook")
-        } else {
-            log("安装完成，共 $n 个 Hook 点")
-            // 复位残留：若模块加载前 TP 已被写成平放档位，断源不会把已下发的值收回来。
-            // 这里主动把 171 节点写回 0（非平放），确保接管后处于干净状态。
-            resetRecliningNode(loader)
+        synchronized(stateLock) {
+            if (bootstrapped.containsKey(hostLoader)) return
+            bootstrapped[hostLoader] = true
         }
+
+        log("进入 Android 系统进程加载路径（process=${lpparam.processName}, pid=${Process.myPid()}, loader=${hostLoader.javaClass.name}）")
+        startSystemContextMonitor(hostLoader)
     }
 
-    /**
-     * 把 TP 的 171 节点复位为 0。
-     * 只在安装成功后执行一次；任何异常都吞掉并记录，绝不影响主流程。
-     */
-    private fun resetRecliningNode(loader: ClassLoader) {
+    /** system_server may receive the package callback before its system Context exists. */
+    private fun startSystemContextMonitor(hostLoader: ClassLoader) {
         runCatching {
-            val cls = Class.forName(Anchors.TOUCH_NODE_MANAGER, false, loader)
-            val instance = XposedHelpers.callStaticMethod(cls, "getInstance")
-                ?: return@runCatching
-            val method = cls.declaredMethods.firstOrNull { isTouchNodeWriter(it) }
-                ?: return@runCatching
-            method.isAccessible = true
-            // 双屏设备分别对应 device 0 / 1；单屏设备对 1 的调用会被宿主自身判空，安全。
-            for (device in intArrayOf(0, 1)) {
-                runCatching {
-                    method.invoke(instance, device, Anchors.TP_RECLINING_MODE_NODE, "0")
-                }.onFailure { log("复位节点 device=$device 失败（可忽略）：${it.message}") }
+            Thread({
+                var installAttempts = 0
+                repeat(120) {
+                    if (synchronized(stateLock) { installed.containsKey(hostLoader) }) return@Thread
+                    val context = currentSystemContext(hostLoader)
+                    if (context != null) {
+                        if (installAttempts >= 3) {
+                            log("BLOCKED: system Context 已就绪，但 3 次安装均未成功")
+                            synchronized(stateLock) { bootstrapped.remove(hostLoader) }
+                            return@Thread
+                        }
+                        installAttempts++
+                        if (installTargetHook(hostLoader, context)) return@Thread
+                        try {
+                            Thread.sleep(750L)
+                        } catch (_: InterruptedException) {
+                            Thread.currentThread().interrupt()
+                            return@Thread
+                        }
+                    } else {
+                        try {
+                            Thread.sleep(250L)
+                        } catch (_: InterruptedException) {
+                            Thread.currentThread().interrupt()
+                            return@Thread
+                        }
+                    }
+                }
+                log("BLOCKED: 30 秒内未取得 system Context 或 Hook 未安装")
+                synchronized(stateLock) { bootstrapped.remove(hostLoader) }
+            }, "LayDetectOff-Bootstrap").apply {
+                isDaemon = true
+                start()
             }
-            log("已尝试把 TP 节点 171 复位为 0")
-        }.onFailure { log("复位残留状态失败（可忽略）：${it.message}") }
+        }.onFailure {
+            synchronized(stateLock) { bootstrapped.remove(hostLoader) }
+            log("BLOCKED: 无法启动 system Context 监视线程: ${it.message}")
+        }
+    }
+
+    private fun currentSystemContext(hostLoader: ClassLoader): Context? = runCatching {
+        val activityThreadClass = Class.forName(Anchors.ACTIVITY_THREAD_CLASS, false, hostLoader)
+        val activityThread = XposedHelpers.callStaticMethod(activityThreadClass, "currentActivityThread")
+            ?: return@runCatching null
+        XposedHelpers.callMethod(activityThread, "getSystemContext") as? Context
+    }.getOrNull()
+
+    private fun installTargetHook(hostLoader: ClassLoader, context: Context): Boolean {
+        synchronized(stateLock) {
+            if (installed.containsKey(hostLoader)) return true
+            if (installing.containsKey(hostLoader)) return false
+            installing[hostLoader] = true
+        }
+
+        var success = false
+        try {
+            val apkPath = moduleApkPath?.takeIf { File(it).isFile }
+            if (apkPath == null) {
+                log("BLOCKED: Xposed StartupParam 未提供有效模块 APK 路径")
+                return false
+            }
+            if (!loadDexKitFromModule(apkPath, context)) return false
+
+            val targetClass = try {
+                Class.forName(Anchors.POWER_MANAGER_SERVICE_CLASS, false, hostLoader)
+            } catch (error: Throwable) {
+                log("BLOCKED: 无法从 android ClassLoader 解析 PowerManagerService: ${error.message}")
+                return false
+            }
+            val targetDexLoader = targetClass.classLoader
+            if (targetDexLoader == null) {
+                log("BLOCKED: PowerManagerService 由 bootstrap ClassLoader 加载，无法枚举目标 DEX")
+                return false
+            }
+            val baseDexClass = try {
+                Class.forName("dalvik.system.BaseDexClassLoader", false, targetDexLoader)
+            } catch (error: Throwable) {
+                log("BLOCKED: Android runtime 未提供 BaseDexClassLoader: ${error.message}")
+                return false
+            }
+            if (!baseDexClass.isInstance(targetDexLoader)) {
+                log("BLOCKED: PowerManagerService defining loader 不是 BaseDexClassLoader: ${targetDexLoader.javaClass.name}")
+                return false
+            }
+            log("PowerManagerService defining loader=${targetDexLoader.javaClass.name}")
+
+            val binding = try {
+                DexKitBridge.create(targetDexLoader, true).use { bridge ->
+                    val dexCount = bridge.getDexNum()
+                    log("DexKit 目标 ClassLoader dexCount=$dexCount")
+                    if (dexCount <= 0) {
+                        log("BLOCKED: DexKit 未从 PowerManagerService defining loader 读到 DEX")
+                        null
+                    } else {
+                        resolveTarget(bridge, targetDexLoader, targetClass)
+                    }
+                }
+            } catch (error: Throwable) {
+                log("DexKit 查询失败（不安装猜测性 Hook）: ${error.javaClass.simpleName}: ${error.message}")
+                return false
+            } ?: return false
+
+            XposedBridge.hookMethod(binding.targetMethod, makeTimeoutHook(binding))
+            success = true
+            log(
+                "Hook 已安装: ${binding.targetMethod.declaringClass.name}#${binding.targetMethod.name}; " +
+                    "faceDown=${binding.faceDownField.name}, policy=${binding.policyMethod.name}"
+            )
+        } catch (error: Throwable) {
+            log("Hook 安装失败: ${error.javaClass.simpleName}: ${error.message}")
+        } finally {
+            synchronized(stateLock) {
+                installing.remove(hostLoader)
+                if (success) installed[hostLoader] = true
+            }
+        }
+        return success
+    }
+
+    /** Read the module APK path from LSPosed's module ClassLoader, not host appInfo. */
+    private fun resolveModuleApkPath(moduleLoader: ClassLoader?): String? {
+        if (moduleLoader == null) return null
+
+        var current: Class<*>? = moduleLoader.javaClass
+        while (current != null) {
+            val field = current.declaredFields.firstOrNull {
+                it.name == "module" && it.type == String::class.java
+            }
+            if (field != null) {
+                runCatching {
+                    field.isAccessible = true
+                    val value = field.get(moduleLoader) as? String
+                    if (value != null && File(value).isFile) return value
+                }
+            }
+            current = current.superclass
+        }
+
+        // LSPosed currently exposes module=<APK path> in the loader description.
+        val fromDescription = Regex("module=([^,\\]]+)")
+            .find(moduleLoader.toString())?.groupValues?.getOrNull(1)
+        return fromDescription?.takeIf { File(it).isFile }
+    }
+
+    /** Extract the exact DexKit ABI from this module APK into system Context cache. */
+    private fun loadDexKitFromModule(moduleApkPath: String, context: Context): Boolean {
+        if (dexKitLoaded) return true
+        synchronized(stateLock) {
+            if (dexKitLoaded) return true
+
+            val abis = if (Process.is64Bit()) Build.SUPPORTED_64_BIT_ABIS else Build.SUPPORTED_32_BIT_ABIS
+            if (abis.isEmpty()) {
+                log("BLOCKED: 当前 system_server ABI 列表为空")
+                return false
+            }
+
+            val zip = try {
+                ZipFile(moduleApkPath)
+            } catch (error: Throwable) {
+                log("BLOCKED: 无法打开模块 APK: ${error.message}")
+                return false
+            }
+
+            zip.use { apk ->
+                val selected = abis.asSequence()
+                    .mapNotNull { abi -> apk.getEntry("lib/$abi/$NATIVE_LIBRARY_NAME")?.let { abi to it } }
+                    .firstOrNull()
+                if (selected == null) {
+                    log("BLOCKED: 模块 APK 不含当前进程 ABI 的 $NATIVE_LIBRARY_NAME")
+                    return false
+                }
+
+                val (abi, entry) = selected
+                val roots = listOf(context.codeCacheDir, context.cacheDir).distinctBy { it.absolutePath }
+                for (root in roots) {
+                    val directory = File(root, MODULE_LIBRARY_DIR)
+                    val probe = runCatching {
+                        if (!directory.exists() && !directory.mkdirs()) return@runCatching null
+                        File.createTempFile(".write-probe-", ".tmp", directory)
+                    }.getOrNull() ?: continue
+                    probe.delete()
+
+                    val destination = File(directory, "libdexkit-$abi.so")
+                    val temporary = File(directory, "libdexkit-$abi-${Process.myPid()}.tmp")
+                    val loaded = runCatching {
+                        if (temporary.exists() && !temporary.delete()) error("无法清理旧临时库")
+                        apk.getInputStream(entry).use { input ->
+                            FileOutputStream(temporary).use { output -> input.copyTo(output) }
+                        }
+                        if (destination.exists() && !destination.delete()) error("无法替换缓存库")
+                        if (!temporary.renameTo(destination)) error("临时库原子改名失败")
+                        System.load(destination.absolutePath)
+                        true
+                    }.getOrElse {
+                        log("DexKit so 加载失败（$abi, ${root.absolutePath}）: ${it.message}")
+                        temporary.delete()
+                        false
+                    }
+                    if (loaded) {
+                        dexKitLoaded = true
+                        log("DexKit native 已从模块 APK 加载（ABI=$abi）")
+                        return true
+                    }
+                }
+            }
+
+            log("BLOCKED: system Context cache 不可写，DexKit native 未加载")
+            return false
+        }
     }
 
     /**
-     * 只读探针：拦截 isTouchNodeSupport(dId, nodeFlag)，把「171 号节点到底支不支持」记下来。
-     *
-     * 为什么需要它：
-     *   本机 /proc/touchpanel/ 下没有 171 对应的节点文件，只能靠宿主自己的判定来确认。
-     *   若 171 不被支持，writeNodeForReclining 实际上是空转，
-     *   那么「平放导致异常」就不是这条链路造成的 —— 必须换方向查，不能假装成功。
-     *   探针只记录返回值，不改任何行为。
+     * Unique static contract:
+     * (long,long)->long, uses the one-day guard, and invokes Math.min(long,long).
+     * Candidate and every required relation are checked before a runtime hook exists.
      */
-    private fun installProbe(loader: ClassLoader): Int {
-        val cls = runCatching {
-            Class.forName(Anchors.TOUCH_NODE_MANAGER, false, loader)
-        }.getOrNull() ?: return 0
-
-        val m = cls.declaredMethods.firstOrNull {
-            it.name == "isTouchNodeSupport" &&
-                it.parameterTypes.size == 2 &&
-                it.parameterTypes[0] == Int::class.javaPrimitiveType &&
-                it.parameterTypes[1] == Int::class.javaPrimitiveType
-        } ?: return 0
-
-        return runCatching {
-            m.isAccessible = true
-            XposedBridge.hookMethod(m, object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    val node = param.args.getOrNull(1) as? Int ?: return
-                    if (node != Anchors.TP_RECLINING_MODE_NODE) return
-                    val dId = param.args.getOrNull(0)
-                    val supported = param.result as? Boolean ?: false
-                    log("探针：isTouchNodeSupport(dId=$dId, node=171) = $supported")
-                    node171Supported = supported
-                }
-            })
-            1
-        }.getOrElse {
-            log("探针安装失败（可忽略）：${it.message}")
-            0
-        }
-    }
-
-    // -----------------------------------------------------------------
-    // L1 + L2：按类名 + 签名定位
-    // -----------------------------------------------------------------
-
-    private fun hookByName(loader: ClassLoader): Int {
-        val engine = runCatching {
-            Class.forName(Anchors.ENGINE_SERVICE_CLASS, false, loader)
-        }.getOrNull()
-
-        var n = 0
-
-        if (engine != null) {
-            // L1：注册方法 -> 直接 return
-            for (m in engine.declaredMethods) {
-                if (m.name != Anchors.REGISTER_SENSOR_METHOD) continue
-                if (m.parameterTypes.isNotEmpty()) continue
-                if (m.returnType != Void.TYPE) continue
-                runCatching {
-                    m.isAccessible = true
-                    XposedBridge.hookMethod(m, object : XC_MethodHook() {
-                        override fun beforeHookedMethod(param: MethodHookParam) {
-                            record("L1-阻止注册lay_detect")
-                            param.result = null
-                        }
-                    })
-                    n++
-                    log("L1 已 Hook ${engine.name}#${m.name}")
-                }.onFailure { log("L1 Hook 失败：${it.message}") }
-            }
-
-            // L2a：姿态写入方法 -> 直接 return
-            for (m in engine.declaredMethods) {
-                if (m.name != Anchors.WRITE_NODE_METHOD) continue
-                if (m.parameterTypes.size != 1) continue
-                if (m.parameterTypes[0] != Float::class.javaPrimitiveType) continue
-                runCatching {
-                    m.isAccessible = true
-                    XposedBridge.hookMethod(m, object : XC_MethodHook() {
-                        override fun beforeHookedMethod(param: MethodHookParam) {
-                            record("L2a-阻止姿态写入 value=${param.args.getOrNull(0)}")
-                            param.result = null
-                        }
-                    })
-                    n++
-                    log("L2a 已 Hook ${engine.name}#${m.name}")
-                }.onFailure { log("L2a Hook 失败：${it.message}") }
-            }
-        } else {
-            log("未找到 ${Anchors.ENGINE_SERVICE_CLASS}，交由 DexKit 处理")
-        }
-
-        // L2b：触控节点写入 -> 只吞 171
-        val touch = runCatching {
-            Class.forName(Anchors.TOUCH_NODE_MANAGER, false, loader)
-        }.getOrNull()
-
-        if (touch != null) {
-            for (m in touch.declaredMethods) {
-                if (!isTouchNodeWriter(m)) continue
-                runCatching {
-                    m.isAccessible = true
-                    XposedBridge.hookMethod(m, object : XC_MethodHook() {
-                        override fun beforeHookedMethod(param: MethodHookParam) {
-                            val node = param.args.getOrNull(1) as? Int ?: return
-                            if (node != Anchors.TP_RECLINING_MODE_NODE) return
-                            record("L2b-阻止写入TP节点171 value=${param.args.getOrNull(2)}")
-                            param.result = false
-                        }
-                    })
-                    n++
-                    log("L2b 已 Hook ${touch.name}#${m.name}")
-                }.onFailure { log("L2b Hook 失败：${it.message}") }
-            }
-        }
-
-        return n
-    }
-
-    /** 触控节点写入方法判据：名字 + (int,int,String) + boolean 返回。 */
-    private fun isTouchNodeWriter(m: Method): Boolean {
-        if (m.name != Anchors.TOUCH_WRITE_METHOD) return false
-        val p = m.parameterTypes
-        if (p.size != 3) return false
-        if (p[0] != Int::class.javaPrimitiveType) return false
-        if (p[1] != Int::class.javaPrimitiveType) return false
-        if (p[2] != String::class.java) return false
-        return m.returnType == Boolean::class.javaPrimitiveType
-    }
-
-    // -----------------------------------------------------------------
-    // L3：DexKit 语义定位（跨版本通杀）
-    // -----------------------------------------------------------------
-
-    private fun hookByDexKit(apkPath: String, loader: ClassLoader): Int {
-        return runCatching {
-            DexKitBridge.create(apkPath).use { bridge ->
-                var n = 0
-
-                // 查询 1：注册平放传感器的方法。
-                // 语义 = 无参 void 方法，且内部调用了 getDefaultSensor 并用到 33171082 这个类型号。
-                // 注意 paramCount(0) 才表示「无参数」；paramTypes() 无参版本是清空约束，不是取无参。
-                val registerCandidates = query(bridge, "注册平放传感器") {
-                    matcher {
-                        returnType("void")
-                        paramCount(0)
-                        addInvoke(Anchors.GET_DEFAULT_SENSOR_DESC)
-                        usingNumbers(Anchors.RECLINING_MODE_SENSOR_TYPE)
-                    }
-                }
-                n += hookAll(registerCandidates, loader, "L3-注册", Mode.REGISTER)
-
-                // 查询 2：姿态写入方法。
-                // 语义 = (float)void，且内部调用了触控节点写入。
-                if (n == 0) {
-                    val writeCandidates = query(bridge, "姿态写入") {
-                        matcher {
-                            returnType("void")
-                            paramTypes("float")
-                            addInvoke {
-                                name(Anchors.TOUCH_WRITE_METHOD)
-                            }
-                        }
-                    }
-                    n += hookAll(writeCandidates, loader, "L3-姿态写入", Mode.SWALLOW)
-                }
-
-                n
-            }
-        }.getOrElse { e ->
-            log("DexKit 路径异常：${e.message}")
-            0
-        }
-    }
-
-    private enum class Mode { REGISTER, SWALLOW }
-
-    private fun query(
+    private fun resolveTarget(
         bridge: DexKitBridge,
-        label: String,
-        init: FindMethod.() -> Unit,
-    ): List<MethodData> {
-        return runCatching { bridge.findMethod(init) }
-            .onFailure { log("$label 查询异常：${it.message}") }
-            .getOrDefault(emptyList())
-            .also { log("$label 候选数=${it.size}") }
-    }
+        hostLoader: ClassLoader,
+        targetClass: Class<*>,
+    ): HookBinding? {
+        val candidates = bridge.findMethod {
+            findFirst = false
+            searchPackages(Anchors.POWER_SERVICE_PACKAGE_PREFIX)
+            matcher {
+                declaredClass(Anchors.POWER_MANAGER_SERVICE_CLASS)
+                returnType("long")
+                paramTypes("long", "long")
+                addUsingNumber(Anchors.DAY_TIMEOUT_GUARD_MS)
+                addUsingField(FieldMatcher().type("boolean"), UsingType.Read)
+                addUsingField(FieldMatcher().type("int"), UsingType.Read)
+                addInvoke(Anchors.MATH_MIN_LONG_DESCRIPTOR)
+            }
+        }.toList()
 
-    private fun hookAll(
-        candidates: List<MethodData>,
-        loader: ClassLoader,
-        label: String,
-        mode: Mode,
-    ): Int {
-        var n = 0
-        for (data in candidates) {
-            val method = runCatching { data.getMethodInstance(loader) }.getOrNull() ?: continue
-            // 只接受确实属于宿主 ClassLoader 的方法，避免误挂到模块自身。
-            if (method.declaringClass.classLoader !== loader) continue
-
-            runCatching {
-                method.isAccessible = true
-                XposedBridge.hookMethod(method, object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        record(label)
-                        param.result = null
-                    }
-                })
-                n++
-                log("[$label] 已 Hook ${data.descriptor}")
-            }.onFailure { log("[$label] Hook 失败 ${data.descriptor}: ${it.message}") }
+        log("DexKit 查询=face-down timeout override，候选数=${candidates.size}")
+        val candidate = candidates.singleOrNull() ?: run {
+            log("BLOCKED: 语义候选不是唯一项；本轮不安装 Hook")
+            return null
         }
-        return n
+        if (candidate.declaredClassName != Anchors.POWER_MANAGER_SERVICE_CLASS) {
+            log("BLOCKED: 唯一候选不属于 PowerManagerService: ${candidate.descriptor}")
+            return null
+        }
+        if (candidate.returnTypeName != "long" || candidate.paramTypeNames != listOf("long", "long")) {
+            log("BLOCKED: 唯一候选的签名与已验证结构不符: ${candidate.descriptor}")
+            return null
+        }
+        if (candidate.invokes.none { it.descriptor == Anchors.MATH_MIN_LONG_DESCRIPTOR }) {
+            log("BLOCKED: 候选缺少 Math.min(long,long) 关系: ${candidate.descriptor}")
+            return null
+        }
+
+        val readFields = candidate.usingFields
+            .filter { it.usingType.isRead() }
+            .map { it.field }
+            .filter { it.declaredClassName == candidate.declaredClassName }
+            .distinctBy { it.descriptor }
+        val faceDownData = readFields.filter {
+            it.descriptor.endsWith(":Z") && !Modifier.isStatic(it.modifiers)
+        }.singleOrNull() ?: run {
+            log("BLOCKED: 候选未唯一读到自身 boolean 状态字段: ${candidate.descriptor}")
+            return null
+        }
+        val wakeLockSummaryData = readFields.filter {
+            it.descriptor.endsWith(":I") && !Modifier.isStatic(it.modifiers)
+        }.singleOrNull() ?: run {
+            log("BLOCKED: 候选未唯一读到自身 int 策略输入字段: ${candidate.descriptor}")
+            return null
+        }
+
+        val policyMethods = candidate.invokes.filter {
+            it.returnTypeName == "long" && it.paramTypeNames == listOf("int", "long") &&
+                !Modifier.isStatic(it.modifiers)
+        }.distinctBy { it.descriptor }
+        val policyData = policyMethods.singleOrNull() ?: run {
+            log("BLOCKED: 候选未唯一引用 (int,long)->long 的实例策略方法")
+            return null
+        }
+        val policyFieldData = readFields.filter {
+            it.typeName == policyData.declaredClassName && !Modifier.isStatic(it.modifiers)
+        }.singleOrNull() ?: run {
+            log("BLOCKED: 未找到与策略方法声明类对应的唯一实例字段")
+            return null
+        }
+
+        return try {
+            val targetMethod = candidate.getMethodInstance(targetClass.classLoader ?: hostLoader)
+            val faceDownField = faceDownData.getFieldInstance(targetClass.classLoader ?: hostLoader)
+            val wakeLockSummaryField = wakeLockSummaryData.getFieldInstance(targetClass.classLoader ?: hostLoader)
+            val policyField = policyFieldData.getFieldInstance(targetClass.classLoader ?: hostLoader)
+            val policyMethod = policyData.getMethodInstance(targetClass.classLoader ?: hostLoader)
+
+            require(targetMethod.declaringClass === targetClass)
+            require(targetMethod.declaringClass.name == candidate.declaredClassName)
+            require(targetMethod.returnType == Long::class.javaPrimitiveType)
+            require(targetMethod.parameterTypes.contentEquals(arrayOf(Long::class.javaPrimitiveType, Long::class.javaPrimitiveType)))
+            require(!Modifier.isStatic(targetMethod.modifiers))
+            require(faceDownField.declaringClass == targetMethod.declaringClass && faceDownField.type == Boolean::class.javaPrimitiveType)
+            require(wakeLockSummaryField.declaringClass == targetMethod.declaringClass && wakeLockSummaryField.type == Int::class.javaPrimitiveType)
+            require(policyField.declaringClass == targetMethod.declaringClass)
+            require(policyField.type.name == policyMethod.declaringClass.name)
+            require(policyMethod.returnType == Long::class.javaPrimitiveType)
+            require(policyMethod.parameterTypes.contentEquals(arrayOf(Int::class.javaPrimitiveType, Long::class.javaPrimitiveType)))
+            require(!Modifier.isStatic(policyMethod.modifiers))
+
+            listOf(faceDownField, wakeLockSummaryField, policyField, policyMethod).forEach {
+                it.isAccessible = true
+            }
+            log(
+                "唯一候选通过关系核验: ${candidate.descriptor}; " +
+                    "bool=${faceDownData.descriptor}; int=${wakeLockSummaryData.descriptor}; " +
+                    "policy=${policyData.descriptor}"
+            )
+            HookBinding(targetMethod, faceDownField, wakeLockSummaryField, policyField, policyMethod)
+        } catch (error: Throwable) {
+            log("BLOCKED: DexKit 成员无法映射到宿主反射对象: ${error.message}")
+            null
+        }
     }
+
+    private fun makeTimeoutHook(binding: HookBinding): XC_MethodHook = object : XC_MethodHook() {
+        override fun afterHookedMethod(param: MethodHookParam) {
+            if (param.hasThrowable()) return
+            val owner = param.thisObject ?: return
+            val faceDown = runCatching { binding.faceDownField.getBoolean(owner) }.getOrElse {
+                logPolicyFailureOnce("读取 face-down 状态失败: ${it.message}")
+                return
+            }
+            if (!faceDown) return
+
+            val normalTimeout = param.args.getOrNull(0) as? Long ?: return
+            // The original method deliberately bypasses the policy override for its 24-hour sentinel.
+            if (normalTimeout == Anchors.DAY_TIMEOUT_GUARD_MS) return
+
+            val restoredTimeout = runCatching {
+                val policy = binding.policyField.get(owner)
+                if (policy == null) {
+                    normalTimeout
+                } else {
+                    val wakeLockSummary = binding.wakeLockSummaryField.getInt(owner)
+                    binding.policyMethod.invoke(policy, wakeLockSummary, normalTimeout) as? Long
+                        ?: error("策略方法未返回 long")
+                }
+            }.getOrElse {
+                logPolicyFailureOnce("重算超时策略失败，先移除 face-down 短超时以避免立即息屏: ${it.message}")
+                normalTimeout
+            }
+
+            param.result = restoredTimeout
+            if (adjustedLogOnce.compareAndSet(false, true)) {
+                log("静态 Hook 分支已执行：face-down clamp 被移除，策略超时=$restoredTimeout ms")
+            }
+        }
+    }
+
+    private fun logPolicyFailureOnce(message: String) {
+        if (policyFailureLogOnce.compareAndSet(false, true)) log("BLOCKED: $message")
+    }
+
+    private data class HookBinding(
+        val targetMethod: Method,
+        val faceDownField: Field,
+        val wakeLockSummaryField: Field,
+        val policyField: Field,
+        val policyMethod: Method,
+    )
 }

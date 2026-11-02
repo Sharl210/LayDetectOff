@@ -127,7 +127,7 @@ def build_arsc(package_name, scope_packages):
 if __name__ == "__main__":
     import sys
     out = sys.argv[1] if len(sys.argv) > 1 else "resources.arsc"
-    data = build_arsc("com.dsh.laydetectoff", ["com.oplus.gesture"])
+    data = build_arsc("com.dsh.laydetectoff", ["android"])
     with open(out, "wb") as f:
         f.write(data)
     print("written %s %d bytes, array/scope -> 0x%08x" % (out, len(data), RES_ID))
